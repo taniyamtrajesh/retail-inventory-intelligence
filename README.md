@@ -51,30 +51,29 @@ Data limitation: The M5 dataset does not directly provide actual on-hand invento
 ## Planned Architecture
 
 ```text
-Kaggle M5 Dataset
-       |
-       v
-Azure Data Lake Storage Gen2
-       |
-       v
-     Bronze
- Raw ingested data
-       |
-       v
-     Silver
- Cleaned and validated data
-       |
-       v
-      Gold
- Aggregated analytics
- Forecast-ready features
-       |
-       v
- Demand Forecasting
-       |
-       v
-Inventory Planning
-  and Evaluation
+Kaggle M5 Retail Dataset
+          |
+          v
+Databricks Free Edition
+Unity Catalog Volume
+          |
+          v
+Bronze Delta Tables
+Raw data ingestion
+          |
+          v
+Silver Delta Tables
+Cleaning, validation, transformations
+          |
+          v
+Gold Delta Tables
+Business aggregations and analytics
+          |
+          v
+Demand Forecasting
+          |
+          v
+Inventory Planning Insights
 ```
 
 Azure Databricks and Apache Spark will be used for data processing and analytics where appropriate.
