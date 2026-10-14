@@ -142,138 +142,235 @@ print("Days simulated:", T)
 
 
 # --------------------------------------------------
-# 4. Configure the inventory policy
+# 4. Reusable inventory simulation function
 # --------------------------------------------------
 
-rng = np.random.default_rng(42)
+def simulate(all_demand, lead, z, delay_p, seed, review=7, warm=28):
+    all_demand = np.asarray(all_demand, dtype=np.int64)
 
-lead_time = 5           # Expected delivery lead time in days
-review_period = 7       # Check inventory every seven days
-service_factor = 1.6    # Controls safety stock
-print("Service factor used:", service_factor)
-delay_probability = 0.15
+    if len(all_demand) <= warm:
+        raise ValueError("Demand history must exceed the warm-up period.")
 
-# Begin with approximately 12 days of stock,
-# estimated using the first 28 days of demand.
-initial_target = (
-    initial_history.mean() * (lead_time + review_period)
-    + service_factor
-    * initial_history.std()
-    * np.sqrt(lead_time + review_period)
-)
+    if np.any(all_demand < 0):
+        raise ValueError("Demand cannot be negative.")
 
-print("Initial target stock:", initial_target)
+    # Reserve the first 28 observed days for initialisation.
+    initial_history = all_demand[:warm]
+    demand = all_demand[warm:]
+    T = len(demand)
 
-on_hand = int(np.ceil(initial_target))
-
-on_order = 0
-arrivals = np.zeros(len(demand) + 30, dtype=np.int64)
-
-logs = []
-
-
-# --------------------------------------------------
-# 5. Simulate demand, stock and replenishment
-# --------------------------------------------------
-
-# --------------------------------------------------
-# 5. Simulate demand, stock and replenishment
-# --------------------------------------------------
-
-for t in range(len(demand)):
-
-    # Record stock available at the start of the day,
-    # before receiving today's delivery.
-    opening_on_hand = on_hand
-
-    # Receive any orders due today.
-    received = int(arrivals[t])
-    on_hand += received
-    on_order -= received
-
-    # Fulfil demand using available stock.
-    units_demanded = int(demand[t])
-    fulfilled = min(units_demanded, on_hand)
-    lost_sales = units_demanded - fulfilled
-
-    on_hand -= fulfilled
-
-    # Log the correct day, accounting for the warm-up period.
-    logs.append({
-        "day": day_cols[start + warmup_days + t],
-        "demand": units_demanded,
-        "fulfilled": fulfilled,
-        "lost_sales": lost_sales,
-        "opening_on_hand": opening_on_hand,
-        "ending_on_hand": on_hand,
-        "on_order": on_order,
-        "received": received
-    })
-
-    # Review inventory every seven simulated days.
-    if t % review_period == 0:
-
-        history_end = warmup_days + t
-        recent_demand = all_demand[history_end - 28:history_end]
-
-        target_stock = (
-            recent_demand.mean() * (lead_time + review_period)
-            + service_factor
-            * recent_demand.std()
-            * np.sqrt(lead_time + review_period)
+    def target(history):
+        return (
+            history.mean() * (lead + review)
+            + z * history.std() * np.sqrt(lead + review)
         )
 
-        order_qty = max(
-            0,
-            int(np.ceil(target_stock)) - on_hand - on_order
-        )
+    initial_target = target(initial_history)
+    initial_stock = int(np.ceil(initial_target))
+    on_hand = initial_stock
+    on_order = 0
 
-        if order_qty > 0:
-            delayed = rng.random() < delay_probability
+    # Pre-generate delays so every service factor faces the
+    # same potential supplier-delay sequence.
+    n_reviews = (T + review - 1) // review
+    rng = np.random.default_rng(seed)
 
-            extra_delay = (
-                int(rng.integers(2, 6)) if delayed else 0
+    delayed = rng.random(n_reviews) < delay_p
+    extensions = rng.integers(2, 6, size=n_reviews)
+    delays = np.where(delayed, extensions, 0)
+
+    arrivals = np.zeros(T + lead + 6, dtype=np.int64)
+    logs = []
+
+    for t, units in enumerate(demand):
+        # Stock at the beginning of the day, before delivery.
+        opening_on_hand = on_hand
+
+        received = int(arrivals[t])
+        on_hand += received
+        on_order -= received
+
+        available_before_demand = on_hand
+        units_demanded = int(units)
+        fulfilled = min(units_demanded, on_hand)
+        lost = units_demanded - fulfilled
+        on_hand -= fulfilled
+
+        order_qty = 0
+
+        # Review every seven days, beginning on evaluation day 0.
+        if t % review == 0:
+            history_end = warm + t
+            history = all_demand[history_end - warm:history_end]
+
+            order_qty = max(
+                0,
+                int(np.ceil(target(history))) - on_hand - on_order
             )
 
-            delivery_days = lead_time + extra_delay
-            arrivals[t + delivery_days] += order_qty
-            on_order += order_qty
+            if order_qty > 0:
+                delay = int(delays[t // review])
+                arrival_day = t + lead + delay
+                arrivals[arrival_day] += order_qty
+                on_order += order_qty
+
+        logs.append({
+            "evaluation_day": t,
+            "opening_on_hand": opening_on_hand,
+            "received": received,
+            "available_before_demand": available_before_demand,
+            "demand": units_demanded,
+            "fulfilled": fulfilled,
+            "lost_sales": lost,
+            "ending_on_hand": on_hand,
+            "order_qty": order_qty,
+            "on_order_end": on_order
+        })
+
+    results = pd.DataFrame(logs)
+
+    # Validate inventory and demand reconciliation.
+    assert (
+        results["fulfilled"] + results["lost_sales"]
+        == results["demand"]
+    ).all(), "Demand reconciliation failed."
+
+    assert (
+        results["ending_on_hand"] >= 0
+    ).all(), "Inventory became negative."
+
+    return results, initial_target, initial_stock
+
 
 # --------------------------------------------------
-# 6. Check and summarise the results
+# 5. Compare all three service-factor settings
 # --------------------------------------------------
 
-results = pd.DataFrame(logs)
+lead_time = 5
+review_period = 7
+delay_probability = 0.15
+warmup_days = 28
+random_seed = 42
 
-assert (
-    results["fulfilled"] + results["lost_sales"]
-    == results["demand"]
-).all(), "Demand reconciliation failed."
+service_factors = [0.3, 0.8, 1.6]
 
-assert (
-    results["ending_on_hand"] >= 0
-).all(), "Inventory became negative."
+experiment_results = {}
+summaries = []
 
-assert (
-    results["opening_on_hand"] >= 0
-).all(), "Opening inventory became negative."
+for z in service_factors:
+    results, initial_target, initial_stock = simulate(
+        all_demand=all_demand,
+        lead=lead_time,
+        z=z,
+        delay_p=delay_probability,
+        seed=random_seed,
+        review=review_period,
+        warm=warmup_days
+    )
 
-print("\nFirst 40 simulation days:")
-print(results.head(40).to_string(index=False))
+    experiment_results[z] = results
 
-print("\n--- Simulation summary ---")
-print("Total demand:", f"{results['demand'].sum():,}")
-print("Units fulfilled:", f"{results['fulfilled'].sum():,}")
-print("Lost sales:", f"{results['lost_sales'].sum():,}")
+    total_demand = int(results["demand"].sum())
+    fulfilled_units = int(results["fulfilled"].sum())
+    lost_units = int(results["lost_sales"].sum())
 
+    fill_rate = (
+        fulfilled_units / total_demand * 100
+        if total_demand else 0.0
+    )
+
+    summaries.append({
+        "service_factor": z,
+        "initial_target": round(initial_target, 2),
+        "initial_stock": initial_stock,
+        "total_demand": total_demand,
+        "fulfilled": fulfilled_units,
+        "lost_sales": lost_units,
+        "fill_rate_pct": round(fill_rate, 2),
+        "lost_sales_days_pct": round(
+            (results["lost_sales"] > 0).mean() * 100, 2
+        ),
+        "zero_ending_stock_days_pct": round(
+            (results["ending_on_hand"] == 0).mean() * 100, 2
+        ),
+        "avg_ending_on_hand": round(
+            results["ending_on_hand"].mean(), 2
+        )
+    })
+
+    print(
+        f"Completed service_factor={z}; "
+        f"initial_stock={initial_stock}; "
+        f"lost_sales={lost_units:,}"
+    )
+
+summary = pd.DataFrame(summaries)
+
+print("\n--- Comparison across service factors ---")
+print(summary.to_string(index=False))
+
+# Inspect the first 40 evaluation days at the baseline factor.
+print("\n--- First 40 evaluation days: service_factor=0.8 ---")
 print(
-    "Days with lost sales:",
-    f"{(results['lost_sales'] > 0).mean() * 100:.2f}%"
+    experiment_results[0.8]
+    .head(40)
+    .to_string(index=False)
 )
 
-print(
-    "Days ending at zero stock:",
-    f"{(results['ending_on_hand'] == 0).mean() * 100:.2f}%"
-)
+print("\nAll simulation runs passed the inventory checks.")
 
-print("\nInventory reconciliation checks passed.")
+
+
+# --------------------------------------------------
+# 6. Robustness check across five supplier-delay seeds
+# --------------------------------------------------
+
+seed_results = []
+
+for seed in range(1, 6):
+    for z in [0.3, 0.8, 1.6]:
+        results, initial_target, initial_stock = simulate(
+            all_demand=all_demand,
+            lead=lead_time,
+            z=z,
+            delay_p=delay_probability,
+            seed=seed,
+            review=review_period,
+            warm=warmup_days
+        )
+
+        total_demand = int(results["demand"].sum())
+        fulfilled = int(results["fulfilled"].sum())
+        lost = int(results["lost_sales"].sum())
+
+        seed_results.append({
+            "seed": seed,
+            "service_factor": z,
+            "fill_rate_pct": (
+                fulfilled / total_demand * 100
+                if total_demand else 0
+            ),
+            "lost_sales": lost,
+            "lost_sales_days_pct": (
+                results["lost_sales"].gt(0).mean() * 100
+            ),
+            "avg_ending_on_hand": (
+                results["ending_on_hand"].mean()
+            )
+        })
+
+seed_df = pd.DataFrame(seed_results)
+
+print("\n--- Results by seed ---")
+print(seed_df.to_string(index=False))
+
+print("\n--- Fill-rate range across five seeds ---")
+fill_summary = seed_df.groupby("service_factor").agg(
+    min_fill_rate=("fill_rate_pct", "min"),
+    mean_fill_rate=("fill_rate_pct", "mean"),
+    max_fill_rate=("fill_rate_pct", "max"),
+    min_lost_sales=("lost_sales", "min"),
+    max_lost_sales=("lost_sales", "max")
+).round(2)
+
+print(fill_summary.to_string())
